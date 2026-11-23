@@ -74,6 +74,24 @@ const int PIN_ELEVATOR       = 6;
 const int PIN_RUDDER         = 7;
 const int PIN_LED            = LED_BUILTIN;
 
+// Seri porta durum yazdirma (tezgah testi icin). Ucusta false birak.
+const bool DEBUG_PRINT = true;
+const unsigned long DEBUG_PERIOD_MS = 250;
+unsigned long lastDebugPrint = 0;
+
+// Kontrol yuzeyi yumusatma: her ~5 ms'de en fazla bu kadar us.
+// 40 us/5 ms ~ tam stroke (1000us) icin ~125 ms.
+const uint16_t SURFACE_STEP  = 40;
+const uint16_t THROTTLE_STEP = 10;   // 1000->2000 ~ 0.5 sn
+const unsigned long STEP_PERIOD_MS = 5;
+unsigned long lastStep = 0;
+
+// Gaz kilidi: baglanti kurulduktan (veya koptuktan) sonra gaz ancak
+// once dusuk konumda (<= THROTTLE_ARM_MAX) gorulurse acilir.
+const uint16_t THROTTLE_ARM_MAX = 1050;
+bool throttleArmed = false;
+
+const unsigned long FAILSAFE_MS = 1500;
 unsigned long lastPacketTime = 0;
 unsigned long lastResetAttempt = 0;
 bool armed = false;
@@ -98,6 +116,28 @@ unsigned long lastMpuUpdate = 0;
 float roll = 0, pitch = 0, yaw = 0;
 bool stabEnabled = false;
 
+// ── Kanal kurali ("pilot kurali", control.py ile ayni) ──
+//   aileron  > 1500 = saga yatis
+//   elevator > 1500 = burun yukari
+//   rudder   > 1500 = burun saga
+// Bir yuzey ters gidiyorsa ilgili REV_* sabitini degistir.
+// Varsayilanlar eski control.py davranisini korur; tezgahta dogrula.
+const bool REV_AILERON      = true;   // sag kanat aileron (D5)
+const bool REV_AILERON_LEFT = false;  // sol kanat, sag kanada GORE ters mi (D4)
+const bool REV_ELEVATOR     = true;
+const bool REV_RUDDER       = false;
+
+// Mekanik merkez duzeltmesi (us). Kumandadaki trimden ayri; kalici ayar.
+const int SUBTRIM_AIL_R = 0;
+const int SUBTRIM_AIL_L = 0;
+const int SUBTRIM_ELE   = 0;
+const int SUBTRIM_RUD   = 0;
+
+// ── Stabilizasyon ──
+// MPU6050: cip yuzu yukari, X burna, Y sol kanada.
+//   roll  = getAngleX()  : + = sag kanat asagi
+//   pitch = getAngleY()  : + = burun ASAGI (burun yukari = -)
+// Kazanclar us/derece ve us/(derece/sn); tezgahta ayarlanacak.
 const float MAX_TARGET_ANGLE = 45.0;
 const float ROLL_KP  = 1.5;
 const float ROLL_KD  = 0.5;
@@ -118,6 +158,7 @@ void resetRadio() {
 
 void centerServos() {
   stabEnabled = false;
+  throttleArmed = false;
   stickAileron = 1500;
   stickElevator = 1500;
   targetThrottle = 1000;
@@ -129,10 +170,10 @@ void centerServos() {
   currentElevator = 1500;
   currentRudder = 1500;
   esc.writeMicroseconds(1000);
-  servoRightAileron.writeMicroseconds(1500);
-  servoLeftAileron.writeMicroseconds(1500);
-  servoElevator.writeMicroseconds(1500);
-  servoRudder.writeMicroseconds(1500);
+  servoRightAileron.writeMicroseconds(1500 + SUBTRIM_AIL_R);
+  servoLeftAileron.writeMicroseconds(1500 + SUBTRIM_AIL_L);
+  servoElevator.writeMicroseconds(1500 + SUBTRIM_ELE);
+  servoRudder.writeMicroseconds(1500 + SUBTRIM_RUD);
 }
 
 uint16_t smoothMove(uint16_t current, uint16_t target, uint16_t maxStep) {
@@ -146,7 +187,6 @@ uint16_t smoothMove(uint16_t current, uint16_t target, uint16_t maxStep) {
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial);
 
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
@@ -189,10 +229,10 @@ void setup() {
 
   Serial.println(F("ESC arm ediliyor... 3 sn"));
   esc.writeMicroseconds(1000);
-  servoRightAileron.writeMicroseconds(1500);
-  servoLeftAileron.writeMicroseconds(1500);
-  servoElevator.writeMicroseconds(1500);
-  servoRudder.writeMicroseconds(1500);
+  servoRightAileron.writeMicroseconds(1500 + SUBTRIM_AIL_R);
+  servoLeftAileron.writeMicroseconds(1500 + SUBTRIM_AIL_L);
+  servoElevator.writeMicroseconds(1500 + SUBTRIM_ELE);
+  servoRudder.writeMicroseconds(1500 + SUBTRIM_RUD);
   delay(3000);
 
   armed = true;
@@ -202,91 +242,126 @@ void setup() {
   Serial.println();
 }
 
+// Pilot kuralindaki degeri servo darbesine cevir (yon + subtrim)
+uint16_t toServo(uint16_t cmd, bool reverse, int subtrim) {
+  int d = (int)cmd - 1500;
+  if (reverse) d = -d;
+  return constrain(1500 + d + subtrim, 1000, 2000);
+}
+
+uint16_t clampCh(uint16_t v) {
+  return constrain(v, 1000, 2000);
+}
+
 void loop() {
+  unsigned long now = millis();
+
   if (radio.available()) {
     radio.read(&packet, sizeof(packet));
-    lastPacketTime = millis();
+    lastPacketTime = now;
 
     if (linkLost) {
       linkLost = false;
       resetAttempts = 0;
       digitalWrite(PIN_LED, HIGH);
-      Serial.println(F("++ Baglanti yeniden kuruldu"));
+      Serial.println(F("++ Baglanti yeniden kuruldu (gaz kilitli, once gazi sifirla)"));
     }
 
-    targetThrottle = packet.throttle;
-    stickAileron   = packet.aileron;
-    stickElevator  = packet.elevator;
-    targetRudder   = packet.rudder;
+    uint16_t thr = clampCh(packet.throttle);
+    if (!throttleArmed && thr <= THROTTLE_ARM_MAX) {
+      throttleArmed = true;
+      Serial.println(F("++ Gaz kilidi acildi"));
+    }
+
+    targetThrottle = throttleArmed ? thr : 1000;
+    stickAileron   = clampCh(packet.aileron);
+    stickElevator  = clampCh(packet.elevator);
+    targetRudder   = clampCh(packet.rudder);
     stabEnabled    = (packet.aux > 1500);
 
     if (!stabEnabled) {
-      targetAileron  = packet.aileron;
-      targetElevator = packet.elevator;
+      targetAileron  = stickAileron;
+      targetElevator = stickElevator;
     }
-
-    Serial.print(F("<< T:"));
-    Serial.print(packet.throttle);
-    Serial.print(F(" R:"));
-    Serial.print(packet.aileron);
-    Serial.print(F(" E:"));
-    Serial.print(packet.elevator);
-    Serial.print(F(" D:"));
-    Serial.print(packet.rudder);
-    Serial.print(F(" STAB:"));
-    Serial.println(stabEnabled ? 'A' : 'P');
   }
 
   mpu.update();
-  if (millis() - lastMpuUpdate > 10) {
+  if (now - lastMpuUpdate > 10) {
     roll  = mpu.getAngleX();
     pitch = mpu.getAngleY();
     yaw   = mpu.getAngleZ();
-    lastMpuUpdate = millis();
+    lastMpuUpdate = now;
   }
 
-  if (stabEnabled && armed) {
-    float targetRoll  = ((float)(stickAileron - 1500) / 500.0) * MAX_TARGET_ANGLE;
-    float targetPitch = -((float)(stickElevator - 1500) / 500.0) * MAX_TARGET_ANGLE;
+  if (stabEnabled && armed && !linkLost) {
+    // Hedef acilar pilot kuralinda: + = saga yatis / burun yukari
+    float targetRoll  = ((float)((int)stickAileron  - 1500) / 500.0) * MAX_TARGET_ANGLE;
+    float targetPitch = ((float)((int)stickElevator - 1500) / 500.0) * MAX_TARGET_ANGLE;
 
-    float rollCorr  = ROLL_KP  * (roll - targetRoll)  + ROLL_KD  * mpu.getGyroX();
-    float pitchCorr = PITCH_KP * (pitch - targetPitch) + PITCH_KD * mpu.getGyroY();
+    float rollNow   = roll;               // + = saga yatik
+    float rollRate  = mpu.getGyroX();     // + = saga donuyor
+    float pitchUp   = -pitch;             // + = burun yukari
+    float pitchRate = -mpu.getGyroY();    // + = burun kalkiyor
+
+    // Cikti da pilot kuralinda: + = saga yatis / burun yukari komutu
+    float rollCorr  = ROLL_KP  * (targetRoll  - rollNow) - ROLL_KD  * rollRate;
+    float pitchCorr = PITCH_KP * (targetPitch - pitchUp) - PITCH_KD * pitchRate;
 
     targetAileron  = constrain(1500 + (int)rollCorr,  1000, 2000);
     targetElevator = constrain(1500 + (int)pitchCorr, 1000, 2000);
   }
 
-  currentThrottle = smoothMove(currentThrottle, targetThrottle, 5);
-  currentAileron  = smoothMove(currentAileron, targetAileron, 5);
-  currentElevator = smoothMove(currentElevator, targetElevator, 5);
-  currentRudder   = smoothMove(currentRudder, targetRudder, 5);
+  if (now - lastStep >= STEP_PERIOD_MS) {
+    lastStep = now;
+    currentThrottle = smoothMove(currentThrottle, targetThrottle, THROTTLE_STEP);
+    currentAileron  = smoothMove(currentAileron,  targetAileron,  SURFACE_STEP);
+    currentElevator = smoothMove(currentElevator, targetElevator, SURFACE_STEP);
+    currentRudder   = smoothMove(currentRudder,   targetRudder,   SURFACE_STEP);
 
-  esc.writeMicroseconds(currentThrottle);
-  servoRightAileron.writeMicroseconds(currentAileron);
-  servoLeftAileron.writeMicroseconds(currentAileron);
-  servoElevator.writeMicroseconds(currentElevator);
-  servoRudder.writeMicroseconds(currentRudder);
+    esc.writeMicroseconds(currentThrottle);
+    servoRightAileron.writeMicroseconds(toServo(currentAileron, REV_AILERON, SUBTRIM_AIL_R));
+    servoLeftAileron.writeMicroseconds(toServo(currentAileron, REV_AILERON != REV_AILERON_LEFT, SUBTRIM_AIL_L));
+    servoElevator.writeMicroseconds(toServo(currentElevator, REV_ELEVATOR, SUBTRIM_ELE));
+    servoRudder.writeMicroseconds(toServo(currentRudder, REV_RUDDER, SUBTRIM_RUD));
+  }
 
-  if (armed && millis() - lastPacketTime > 1500) {
+  // Failsafe: sinyal yoksa gazi kes, yuzeyleri ortala, radyoyu periyodik resetle
+  if (armed && now - lastPacketTime > FAILSAFE_MS) {
     if (!linkLost) {
       linkLost = true;
       centerServos();
-      Serial.println(F("!! Sinyal kesildi - Servolar merkezlendi !!"));
+      lastResetAttempt = now;
+      Serial.println(F("!! Sinyal kesildi - gaz kesildi, servolar merkezlendi !!"));
     }
 
-    digitalWrite(PIN_LED, !digitalRead(PIN_LED));
+    static unsigned long lastBlink = 0;
+    if (now - lastBlink > 200) {
+      lastBlink = now;
+      digitalWrite(PIN_LED, !digitalRead(PIN_LED));
+    }
 
-    if (millis() - lastResetAttempt > 5000) {
+    if (now - lastResetAttempt > 5000) {
       if (resetAttempts < 3) {
         Serial.print(F("!! NRF yeniden baslatiliyor ("));
         Serial.print(resetAttempts + 1);
         Serial.println(F("/3)"));
+        resetAttempts++;
       }
       resetRadio();
-      lastResetAttempt = millis();
-      if (resetAttempts < 3) resetAttempts++;
+      lastResetAttempt = now;
     }
+  }
 
-    lastPacketTime = millis();
+  if (DEBUG_PRINT && now - lastDebugPrint > DEBUG_PERIOD_MS) {
+    lastDebugPrint = now;
+    Serial.print(F("T:"));  Serial.print(currentThrottle);
+    Serial.print(F(" A:")); Serial.print(currentAileron);
+    Serial.print(F(" E:")); Serial.print(currentElevator);
+    Serial.print(F(" R:")); Serial.print(currentRudder);
+    Serial.print(F(" STAB:")); Serial.print(stabEnabled ? 'A' : 'P');
+    Serial.print(F(" GAZ:")); Serial.print(throttleArmed ? F("ACIK") : F("KILITLI"));
+    Serial.print(F(" LINK:")); Serial.print(linkLost ? F("YOK") : F("OK"));
+    Serial.print(F(" roll:")); Serial.print(roll, 1);
+    Serial.print(F(" pitch:")); Serial.println(pitch, 1);
   }
 }

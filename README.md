@@ -1,40 +1,74 @@
 # RC Plane Controller
 
-2x Arduino Nano + NRF24L01 + MPU6050 ile 5 kanal kablosuz RC uçak kontrol ve stabilizasyon sistemi.
+2× Arduino Nano + NRF24L01+PA+LNA + MPU6050 ile Steam Deck'ten kumanda edilen RC uçak.
+
+```
+Steam Deck (control.py) ──USB seri──> Verici Nano ──NRF24──> Alıcı Nano ──> ESC + 4 servo
+                                                               └── MPU6050 (stabilizasyon)
+```
 
 ## Proje Yapısı
 
 ```
-├── transmitter/transmitter.ino   # Verici - Binary protokol, NRF24L01 gönderir
-├── receiver/receiver.ino         # Alıcı - ESC + 4 servo (dual aileron) + MPU6050 stabilizasyon
-├── control.py                    # PC klavye + joystick kontrol scripti
-├── requirements.txt              # Python bağımlılıkları
-└── .gitignore
+├── control.py                    # Steam Deck yer istasyonu (tam ekran arayüz)
+├── transmitter/transmitter.ino   # Verici: seri çerçeve doğrulama + NRF24 gönderim
+├── receiver/receiver.ino         # Alıcı: gaz kilidi, failsafe, servo yön/subtrim, stabilizasyon
+├── launch.sh                     # Steam Deck başlatma
+└── requirements.txt
 ```
 
-## Kanal Listesi
+## Kanallar ve "pilot kuralı"
 
-| Kanal | İşlev | Tip | Alıcı Pini | Kontrol |
-|-------|-------|-----|-----------|---------|
-| 1 | Throttle (Gaz) | ESC | D3 | W / S / L2-R2 |
-| 2 | Aileron (Roll) | Servo x2 | D5 + D4 | ← → / Sol Stick X |
-| 3 | Elevator (Kuyruk Yatay) | Servo | D6 | ↑ ↓ / Sol Stick Y |
-| 4 | Rudder (Kuyruk Dikey) | Servo | D7 | A / D / Sağ Stick X |
+Kumanda ve alıcı aynı kuralı kullanır; servo yönleri yalnız alıcıda ayarlanır.
 
-**Dual Aileron:** Sağ (D5) ve sol (D4) kanat aynı PWM değerini alır. Asimetrik kanat
-hareketi servoların mekanik olarak ters montajı ile sağlanır — iki servoya aynı sinyal
-gittiğinde biri yukarı diğeri aşağı hareket eder.
+| Kanal | Pin | 1500'ün üstü demek | Kumanda |
+|---|---|---|---|
+| Throttle | D3 (ESC) | daha fazla gaz | Sol stick Y (artımlı) |
+| Aileron | D5 sağ, D4 sol | sağa yatış | Sağ stick X |
+| Elevator | D6 | burun yukarı | Sağ stick Y (geri çek = burun yukarı) |
+| Rudder | D7 | burun sağa | Sol stick X |
+| AUX | — | 2000 = stabilizasyon açık | A |
 
-> Servo montaj yönüne göre asimetri sağlanmazsa `receiver.ino` içinde D4 satırı
-> `3000 - currentAileron` olarak değiştirilebilir.
+Bir yüzey ters gidiyorsa `receiver.ino` içinde ilgili sabiti değiştir:
 
-## NRF24L01 Bağlantısı
+```cpp
+const bool REV_AILERON      = true;   // sağ kanat aileron (D5)
+const bool REV_AILERON_LEFT = false;  // sol kanat, sağ kanada göre ters mi (D4)
+const bool REV_ELEVATOR     = true;
+const bool REV_RUDDER       = false;
+const int  SUBTRIM_AIL_R = 0, SUBTRIM_AIL_L = 0, SUBTRIM_ELE = 0, SUBTRIM_RUD = 0;  // µs
+```
 
-### Shield/Adaptör varsa (önerilen)
+Varsayılanlar eski control.py davranışını korur; tezgâhta doğrulanmalı.
 
-| NRF24L01 Shield | Arduino Nano |
-|-----------------|-------------|
-| VCC | **5V** |
+---
+
+## Güç ve Bağlantı (doğrulanmış, 3S LiPo)
+
+```
+LiPo 3S ─┬─ ESC ── motor
+         │    ├─ kırmızı (dahili BEC 5V/2A) ──[1000µF]── 4× SG90 +
+         │    └─ kahverengi (GND) ───────────────────── 4× SG90 −
+         │                                                  │
+         └─ LM2596 IN   OUT+ (5.0–5.1V) ─┬─ Nano 5V pini    │
+                                         ├─ MPU6050 VCC     │
+                                         └─ NRF adaptör VCC ─[100µF]
+                        OUT− ────────────┬─ Nano GND, MPU GND, NRF GND
+                                         └──────────────────┘  ortak GND kablosu
+```
+
+Kurallar:
+- **Nano VIN boş kalır.** VIN kartın regülatöründen geçer, ~7 V ister; 5 V verilirse hat ~4 V'a düşer.
+- **İki 5V hattı (ESC BEC ve LM2596) birbirine bağlanmaz**, yalnız GND'leri ortaktır.
+- Servo GND'si Nano GND'sine **doğrudan** bağlı olmalı; pil kabloları üzerinden dolaşan toprak servo titremesi yapar.
+- LM2596 çıkışı Nano bağlanmadan önce **multimetreyle** 5.0–5.1 V'a ayarlanır; trimpot sıcak silikonla sabitlenir.
+- 3S'te ESC'nin lineer BEC'i 4 SG90 ile ısınabilir: pervanesiz 10 dk servo testiyle ısıyı ve voltajı (≥ 4.8 V) kontrol et. Yetmezse servolar için ayrı anahtarlamalı UBEC (ESC kırmızı teli yalıtılır).
+
+### NRF24L01+PA+LNA (adaptör kartla, iki tarafta aynı)
+
+| Adaptör | Nano |
+|---|---|
+| VCC | 5V (alıcıda LM2596 OUT+) + 100 µF |
 | GND | GND |
 | CE | D9 |
 | CSN | D10 |
@@ -42,177 +76,71 @@ gittiğinde biri yukarı diğeri aşağı hareket eder.
 | MOSI | D11 |
 | MISO | D12 |
 
-### Çıplak modül (shield yok)
+- Modülün kendi pinlerine 5 V verilmez (en fazla 3.6 V); besleme her zaman adaptörden.
+- Tezgâhta (modüller < 1 m) `RADIO_PA = RF24_PA_LOW`; PA+LNA yakında en yüksek güçte alıcıyı doyurur. Uçuşta vericide `RF24_PA_MAX`.
 
-| NRF24L01 | Arduino Nano |
-|----------|-------------|
-| VCC | **3.3V** |
+### MPU6050
+
+| MPU6050 | Nano |
+|---|---|
+| VCC | 5V |
 | GND | GND |
-| CE | D9 |
-| CSN | D10 |
-| SCK | D13 |
-| MOSI | D11 |
-| MISO | D12 |
+| SCL | A5 |
+| SDA | A4 |
 
-> Shield varsa VCC→5V, yoksa VCC→3.3V. Çıplak modülde VCC-GND arasına 10-100µF kondansatör şart.
-
----
-
-## Alıcı (Receiver) Bağlantıları
-
-```
-                            +-----------+
-      LiPo Pil              | Arduino   |
-      +   -                 | Nano      |
-      |   |                 |           |
-      |   |    NRF24L01     |           |    Sag Aileron D5
-      |   |    +-------+    |           |    Sol Aileron D4
-      |   |    | VCC --|----|5V/3.3V    |    Elevator     D6
-      |   |    | GND --|----|GND        |    Rudder       D7
-      |   |    | CE  --|----|D9         |
-      |   |    | CSN --|----|D10        |
-      |   |    | SCK --|----|D13        |
-      |   |    | MOSI -|----|D11        |
-      |   |    | MISO -|----|D12        |
-      |   |    +-------+    |           |
-      |   |                 |           |
-      |   |    ESC          |           |
-      |   |    +--------+   |           |
-      +---|----|Pil +   |   |           |
-          |    |Pil -   |   |           |
-          |    |Motor A |   |           |
-          |    |Motor B +---+ Motor     |
-          |    |Motor C |   |           |
-          |    |Sinyal--|---|D3         |
-          |    |GND   --|---|GND        |
-          |    |5V(BEC) |  (USB varsa boş)
-          |    +--------+  (USB yoksa VIN)
-```
-
-### Alıcı Pin Tablosu
-
-| Pin    | Bağlantı            | Açıklama                     |
-|--------|---------------------|------------------------------|
-| D3     | ESC Sinyal          | PWM (1000-2000µs)            |
-| D4     | Sol Kanat Aileron   | D5 ile aynı değer            |
-| D5     | Sağ Kanat Aileron   | Roll komutu                  |
-| D6     | Elevator            | Kuyruk yatay                 |
-| D7     | Rudder              | Kuyruk dikey                 |
-| GND    | ESC GND + Servo GND | Ortak toprak                 |
-| 5V/VIN | ESC BEC 5V          | USB yoksa bağla, USB varsa boş |
-
-### MPU6050 Bağlantısı (Stabilizasyon)
-
-| MPU6050 | Arduino Nano |
-|---------|-------------|
-| VCC     | **5V**       |
-| GND     | GND          |
-| SCL     | A5           |
-| SDA     | A4           |
-
-> MPU6050'yi titreşim izolasyonlu monte edin (sünger/çift taraflı bant).
-> X ekseni ileri, Y ekseni sağ kanada, Z ekseni aşağı bakmalı.
-> Arduino Library Manager'dan **MPU6050_light** kütüphanesini yükleyin.
-
----
-
-## Verici (Transmitter) Bağlantıları
-
-```
-      PC (USB)
-         |
-    Arduino Nano
-         |
-    NRF24L01 (Shield)
-```
-
-Sadece NRF24L01 bağlı. PC'ye USB ile bağlı.
+**Montaj:** çip yüzü yukarı, X oku burna, Y oku sol kanada. Titreşime karşı sünger/çift taraflı bantla. Açılışta kalibrasyon için uçak düz ve hareketsiz durmalı.
 
 ---
 
 ## Kurulum
 
 ```bash
-# 1. Python sanal ortam ve bağımlılıklar
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-
-# 2. Arduino IDE'de kütüphaneleri yükle
-#    Araçlar > Kütüphane Yöneticisi > "RF24 by TMRh20"
-#    Araçlar > Kütüphane Yöneticisi > "MPU6050_light"
-
-# 3. transmitter/transmitter.ino → Verici Nano'ya yükle
-# 4. receiver/receiver.ino      → Alıcı Nano'ya yükle
 ```
 
-## Kullanım
+Arduino IDE → Kütüphane Yöneticisi: **RF24** (TMRh20) ve **MPU6050_light**.
+`transmitter/transmitter.ino` → verici Nano, `receiver/receiver.ino` → alıcı Nano.
 
-Alıcıyı aç (pili bağla), ESC arm sesini bekle (3 sn), sonra:
+## Kullanım (Steam Deck)
 
 ```bash
-source venv/bin/activate
-python3 control.py
+./launch.sh            # tam ekran
+./launch.sh --windowed # pencere
+python3 control.py --tty   # arayüzsüz
 ```
 
-Pygame penceresi açılır. Joystick bağlıysa otomatik algılanır, stick pozisyonları
-canlı gösterilir. Klavye ve joystick aynı anda çalışır.
-
-### Klavye
+Arayüz seri portu ve kumandayı otomatik bulur, koparsa yeniden bağlanır. Kumanda yokken güvenli değerler (gaz 1000, yüzeyler orta) gönderilir.
 
 | Tuş | İşlev |
-|-----|-------|
-| **W / S** | Gaz artır / azalt |
-| **A / D** | Rudder (kuyruk dikey) |
-| **← →** | Aileron (kanat roll) |
-| **↑ ↓** | Elevator (kuyruk yatay) |
-| **Space** | Acil gaz kes |
-| **Q / ESC** | Çıkış |
+|---|---|
+| **Sol stick Y** | Gaz: yukarı tut = artır, aşağı tut = azalt, bırak = kalır (tam stick ≈ %60/sn) |
+| **L1 + R1 (1 sn)** | ARM / DISARM. ARM yalnız gaz sıfırken |
+| **L2** | Acil kes: gaz 0 + disarm |
+| **A** | Stabilizasyon aç/kapa |
+| **X / Y** | Rate: YUMUŞAK (%60, expo 0.3) / NORMAL (%100, expo 0.2). Açılış: YUMUŞAK |
+| **D-pad** | Trim: sol/sağ = aileron, aşağı/yukarı = elevator (5 µs adım, ±100). `trims.json`'a kaydedilir |
+| **Select (1 sn)** | Trimleri sıfırla |
+| **Start (1 sn)** | Çıkış (çıkarken gaz 0 gönderilir) |
 
-### Steam Deck / Joystick
+Stabilizasyon açıkken stick "hedef açı" anlamına gelir ve trim uygulanmaz.
 
-| Kumanda | Kanal |
-|---------|-------|
-| **Sol Stick X** | Aileron |
-| **Sol Stick Y** | Elevator |
-| **Sağ Stick X** | Rudder |
-| **L2** | Gaz artır |
-| **R2** | Gaz azalt |
-| **L1** | Gaz kes (acil) |
-| **D-Pad Sol/Sağ** | Aileron (yedek) |
-| **D-Pad Yukarı/Aşağı** | Elevator (yedek) |
-| **Start** | Çıkış |
-| **A / Cross** | Stabilizasyon aç/kapa |
+## Seri protokol (PC → verici)
 
-### Stabilizasyon (Auto-Level)
+13 bayt: `0xAA 0x55` + 5 × uint16 LE (throttle, aileron, elevator, rudder, aux) + XOR checksum.
+Checksum'ı tutmayan ya da 1000–2000 dışındaki çerçeve atılır.
 
-MPU6050 ile uçağın roll ve pitch açıları okunur, PD kontrolcü ile otomatik
-dengeleme yapılır. Stick merkezdeyken uçak kendini düz tutar.
+## Güvenlik
 
-- **Açma/Kapama:** Joystick'te **A (Cross)** tuşu
-- **AUX kanalı:** 2000 = aktif, 1000 = pasif
-- **Max hedef açı:** ±45° (tam stick)
-- **Failsafe:** Sinyal kesilince stabilizasyon otomatik kapanır
+- **Gaz kilidi (alıcı):** Bağlantı kurulunca veya koptuktan sonra gaz, önce ≤1050 görülmeden açılmaz.
+- **Failsafe:** 1.5 sn sinyal yoksa gaz kesilir, yüzeyler ortalanır, stabilizasyon kapanır, NRF yeniden başlatılır.
+- Alıcı tüm kanalları 1000–2000'e sınırlar. Seri monitörde (115200) 250 ms'de bir durum satırı: `GAZ:KILITLI/ACIK`, `LINK`, roll/pitch.
+- ESC bir kez 1000–2000 µs aralığına kalibre edilmeli.
+- **Pervaneyi takmadan önce** her yüzeyin yönünü ve failsafe'i test et.
 
-#### PID Ayarı
+## Stabilizasyon
 
-`receiver/receiver.ino` içinde ayarlanabilir:
-
-```cpp
-const float ROLL_KP  = 1.5;   // Roll oransal kazancı
-const float ROLL_KD  = 0.5;   // Roll türev kazancı (sönümleme)
-const float PITCH_KP = 1.5;   // Pitch oransal kazancı
-const float PITCH_KD = 0.5;   // Pitch türev kazancı
-```
-
-> İlk uçuşta düşük kazançlarla başlayın. Salınım varsa KD artırın,
-> yavaş tepki varsa KP artırın. Yön ters ise KP işaretini değiştirin.
-
-### Güvenlik
-
-- Alıcı 1.5 saniyeden fazla sinyal alamazsa otomatik gaz keser (failsafe)
-- Stabilizasyon sinyal kesilince otomatik kapanır
-- Çıkışta (Q) gaz otomatik 1000'e çekilir
-- ESC arm olana kadar bekle (bip sesi)
-- **Pervaneyi takmadan önce sistemi test et**
-- MPU6050 kalibrasyonu her açılışta yapılır (3-4 sn), uçağı sabit tutun
+PD kontrolcü, pilot kuralında: `komut = KP·(hedef − açı) − KD·açısal hız`. Max hedef açı ±45°.
+`ROLL_KP/KD`, `PITCH_KP/KD` (µs/°, µs/(°/s)) tezgâhta ayarlanmalı; ilk uçuşta stabilizasyon kapalı.
+Tezgâh kontrolü: stab açıkken uçağı sağa yatır → aileron sola yatış yönünde düzeltmeli; burnu kaldır → elevator burun aşağı yönünde.
