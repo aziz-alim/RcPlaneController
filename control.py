@@ -23,11 +23,16 @@ Servo yonleri alicidaki REV_* sabitleriyle ayarlanir, burada degil.
 
 Seri cerceve (PC -> verici): 0xAA 0x55 + 5 x uint16 LE + XOR checksum (13 bayt)
 Kanal sirasi: throttle, aileron, elevator, rudder, aux
+
+Telemetri (verici -> PC): 0xBB 0x66 + 13 bayt + XOR checksum (16 bayt)
+  linkPct u8, fresh u8, seq u8, roll10 i16, pitch10 i16, battMv u16,
+  flags u8, rxRate u8, throttle u16   (roll + = saga yatik, pitch + = burun yukari)
 """
 
 import argparse
 import glob
 import json
+import math
 import os
 import select as sel
 import struct
@@ -59,6 +64,15 @@ DEFAULT_RATE = "YUMUSAK"
 CH_MIN, CH_MAX, CH_MID = 1000, 2000, 1500
 SYNC = b'\xaa\x55'
 
+TELEM_SYNC = b'\xbb\x66'
+TELEM_FMT = "<BBBhhHBBH"
+TELEM_LEN = struct.calcsize(TELEM_FMT)   # 13
+TELEM_STALE_S = 1.0
+TF_STAB, TF_THR_ARMED, TF_BATT_LOW, TF_BATT_OK = 0x01, 0x02, 0x04, 0x08
+BATT_CELLS = 3
+BATT_WARN_V_CELL = 3.7
+BATT_LOW_V_CELL = 3.5
+
 TRIM_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trims.json")
 
 
@@ -85,6 +99,98 @@ def deadzone(v):
 
 def shape(v, rate, expo):
     return rate * ((1.0 - expo) * v + expo * v * v * v)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Telemetri (verici -> PC)
+# ═══════════════════════════════════════════════════════════════
+
+class TelemetryParser:
+    """Bayt akisindan telemetri cercevelerini ayiklar (bozuklari atar)."""
+
+    def __init__(self):
+        self.buf = bytearray()
+        self.bad = 0
+
+    def feed(self, data):
+        self.buf += data
+        out = []
+        total = len(TELEM_SYNC) + TELEM_LEN + 1
+        while True:
+            i = self.buf.find(TELEM_SYNC)
+            if i < 0:
+                # yarim sync bayti kalabilir
+                del self.buf[:max(0, len(self.buf) - 1)]
+                break
+            if i:
+                del self.buf[:i]
+            if len(self.buf) < total:
+                break
+            body = bytes(self.buf[2:2 + TELEM_LEN])
+            chk = 0
+            for b in body:
+                chk ^= b
+            if chk != self.buf[2 + TELEM_LEN]:
+                self.bad += 1
+                del self.buf[:1]          # sonraki sync'i ara
+                continue
+            del self.buf[:total]
+            (link, fresh, seq, roll10, pitch10, batt_mv,
+             flags, rx_rate, thr) = struct.unpack(TELEM_FMT, body)
+            out.append({"link": link, "fresh": bool(fresh), "seq": seq,
+                        "roll": roll10 / 10.0, "pitch": pitch10 / 10.0,
+                        "batt_mv": batt_mv, "flags": flags,
+                        "rx_rate": rx_rate, "throttle": thr})
+        return out
+
+
+class Telemetry:
+    """Son bilinen ucak durumu."""
+
+    def __init__(self):
+        self.link = 0              # verici ACK orani %
+        self.last_frame = -1e9     # vericiden son cerceve
+        self.last_fresh = -1e9     # ucaktan son yeni veri
+        self.roll = self.pitch = 0.0
+        self.batt_mv = 0
+        self.flags = 0
+        self.rx_rate = 0
+        self.throttle = 1000
+
+    def apply(self, frames, now):
+        for f in frames:
+            self.last_frame = now
+            self.link = f["link"]
+            if f["fresh"]:
+                self.last_fresh = now
+                self.roll, self.pitch = f["roll"], f["pitch"]
+                self.batt_mv = f["batt_mv"]
+                self.flags = f["flags"]
+                self.rx_rate = f["rx_rate"]
+                self.throttle = f["throttle"]
+
+    def ok(self, now):
+        return now - self.last_fresh < TELEM_STALE_S
+
+    def tx_ok(self, now):
+        return now - self.last_frame < TELEM_STALE_S
+
+    @property
+    def batt_sense(self):
+        return bool(self.flags & TF_BATT_OK) and self.batt_mv > 0
+
+    @property
+    def batt_v(self):
+        return self.batt_mv / 1000.0
+
+    def batt_level(self):
+        """'ok' / 'warn' / 'low' (hucre basi)."""
+        cell = self.batt_v / BATT_CELLS
+        if cell < BATT_LOW_V_CELL:
+            return "low"
+        if cell < BATT_WARN_V_CELL:
+            return "warn"
+        return "ok"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -404,6 +510,10 @@ class SerialLink:
                     self.ser = serial.Serial(port, BAUD, timeout=0, write_timeout=0.05)
                     self.port = port
                     self.ready_at = now + 1.5   # Nano USB acilinca resetlenir
+                    try:
+                        self.ser.reset_input_buffer()
+                    except Exception:
+                        pass
                 except Exception:
                     self.ser = None
 
@@ -415,6 +525,16 @@ class SerialLink:
             self.frames += 1
         except Exception:
             self.close()
+
+    def read(self):
+        if self.ser is None:
+            return b""
+        try:
+            n = self.ser.in_waiting
+            return self.ser.read(n) if n else b""
+        except Exception:
+            self.close()
+            return b""
 
     def close(self):
         if self.ser is not None:
@@ -437,6 +557,7 @@ C = {
     "text": (220, 224, 235), "dim": (125, 132, 150),
     "accent": (0, 200, 175), "amber": (255, 186, 60),
     "green": (70, 205, 110), "red": (235, 70, 70), "blue": (90, 150, 255),
+    "sky": (52, 120, 200), "ground": (130, 86, 46),
 }
 
 
@@ -493,21 +614,144 @@ class Dashboard:
             pg.draw.polygon(self.canvas, C["amber"],
                             [(tx, by + 20), (tx - 7, by + 32), (tx + 7, by + 32)])
 
-    def _stick(self, cx, cy, ax, ay, title, xl, yl):
+    def _stick(self, cx, cy, ax, ay, title, sub, r=62):
         pg = self.pg
-        r = 120
         pg.draw.circle(self.canvas, C["bg"], (cx, cy), r)
         pg.draw.circle(self.canvas, C["line"], (cx, cy), r, 2)
         pg.draw.line(self.canvas, C["line"], (cx - r, cy), (cx + r, cy), 1)
         pg.draw.line(self.canvas, C["line"], (cx, cy - r), (cx, cy + r), 1)
-        dx, dy = cx + int(clamp(ax, -1, 1) * (r - 14)), cy + int(clamp(ay, -1, 1) * (r - 14))
-        pg.draw.circle(self.canvas, C["accent"], (dx, dy), 14)
-        self._txt(title, self.f_md, C["text"], (cx, cy - r - 44), "midtop")
-        self._txt(xl, self.f_sm, C["dim"], (cx, cy + r + 12), "midtop")
-        self._txt(yl, self.f_sm, C["dim"], (cx - r - 14, cy), "midright")
+        dx, dy = cx + int(clamp(ax, -1, 1) * (r - 10)), cy + int(clamp(ay, -1, 1) * (r - 10))
+        pg.draw.circle(self.canvas, C["accent"], (dx, dy), 10)
+        self._txt(title, self.f_sm, C["text"], (cx - r - 16, cy - 2), "bottomright")
+        self._txt(sub, self.f_sm, C["dim"], (cx - r - 16, cy + 2), "topright")
+
+    def _horizon(self, cx, cy, r, roll, pitch, live):
+        """Yapay ufuk. roll + = saga yatik, pitch + = burun yukari (derece)."""
+        pg = self.pg
+        size = 2 * r
+        surf = pg.Surface((size, size))
+        surf.fill(C["sky"])
+        ppd = r / 40.0                      # piksel / derece (+-40 derece gorunur)
+        phi = math.radians(roll)
+        dx, dy = math.cos(phi), -math.sin(phi)   # ufuk yonu (saga yatista sag uc yukari)
+        nx, ny = math.sin(phi), math.cos(phi)    # yere dogru normal
+        off = clamp(pitch, -80, 80) * ppd        # burun yukari -> ufuk asagi
+        hx, hy = r + nx * off, r + ny * off
+        L = size * 2
+        ground = [(hx - dx * L, hy - dy * L), (hx + dx * L, hy + dy * L),
+                  (hx + dx * L + nx * L, hy + dy * L + ny * L),
+                  (hx - dx * L + nx * L, hy - dy * L + ny * L)]
+        pg.draw.polygon(surf, C["ground"], ground)
+        pg.draw.line(surf, (240, 240, 240), ground[0], ground[1], 3)
+        # Yunuslama merdiveni (10 derecede bir)
+        for deg in (-30, -20, -10, 10, 20, 30):
+            o = off - deg * ppd
+            px, py = r + nx * o, r + ny * o
+            hw = r * (0.28 if deg % 20 else 0.4)
+            a = (px - dx * hw, py - dy * hw)
+            b = (px + dx * hw, py + dy * hw)
+            pg.draw.line(surf, (235, 235, 235), a, b, 2)
+            lbl = self.f_sm.render(str(abs(deg)), True, (235, 235, 235))
+            surf.blit(lbl, lbl.get_rect(center=(b[0] + dx * 18, b[1] + dy * 18)))
+        # Daire maskesi
+        mask = pg.Surface((size, size))
+        mask.fill(C["panel"])
+        mask.set_colorkey((255, 0, 255))
+        pg.draw.circle(mask, (255, 0, 255), (r, r), r)
+        surf.blit(mask, (0, 0))
+        if not live:
+            dim = pg.Surface((size, size), pg.SRCALPHA)
+            pg.draw.circle(dim, (14, 16, 22, 190), (r, r), r)
+            surf.blit(dim, (0, 0))
+        self.canvas.blit(surf, (cx - r, cy - r))
+        pg.draw.circle(self.canvas, C["line"], (cx, cy), r, 3)
+        # Yatis olcegi (ust)
+        for deg in (-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60):
+            a = math.radians(deg - 90)
+            r1 = r - (14 if deg in (0, -30, 30, -60, 60) else 8)
+            pg.draw.line(self.canvas, (235, 235, 235),
+                         (cx + math.cos(a) * r1, cy + math.sin(a) * r1),
+                         (cx + math.cos(a) * r, cy + math.sin(a) * r), 2)
+        # Yatis isareti (gokyuzuyle doner)
+        a = math.radians(-roll - 90)
+        tip = (cx + math.cos(a) * (r - 16), cy + math.sin(a) * (r - 16))
+        base = r - 32
+        b1 = (cx + math.cos(a - 0.07) * base, cy + math.sin(a - 0.07) * base)
+        b2 = (cx + math.cos(a + 0.07) * base, cy + math.sin(a + 0.07) * base)
+        pg.draw.polygon(self.canvas, C["amber"], [tip, b1, b2])
+        # Sabit ucak simgesi
+        am = C["amber"]
+        pg.draw.line(self.canvas, am, (cx - 70, cy), (cx - 22, cy), 6)
+        pg.draw.line(self.canvas, am, (cx - 22, cy), (cx - 22, cy + 12), 6)
+        pg.draw.line(self.canvas, am, (cx + 22, cy), (cx + 70, cy), 6)
+        pg.draw.line(self.canvas, am, (cx + 22, cy), (cx + 22, cy + 12), 6)
+        pg.draw.circle(self.canvas, am, (cx, cy), 5)
+        if not live:
+            self._txt("TELEMETRI YOK", self.f_md, C["red"], (cx, cy + 40), "midtop")
+
+    def _meter(self, x, y, w, frac, col):
+        pg = self.pg
+        pg.draw.rect(self.canvas, C["bg"], (x, y, w, 14), border_radius=7)
+        fw = int(w * clamp(frac, 0.0, 1.0))
+        if fw > 0:
+            pg.draw.rect(self.canvas, col, (x, y, max(14, fw), 14), border_radius=7)
+
+    def _telemetry_panel(self, tp, tel, now):
+        live = tel.ok(now)
+        self._panel(tp)
+        self._horizon(tp.x + 170, tp.centery, 140, tel.roll, tel.pitch, live)
+
+        x0 = tp.x + 350
+        x1 = tp.x + 540
+        col = C["text"] if live else C["dim"]
+        self._txt("YATIS", self.f_sm, C["dim"], (x0, tp.y + 22))
+        self._txt(f"{tel.roll:+.0f}\u00b0", self.f_lg, col, (x0, tp.y + 48))
+        self._txt("BURUN", self.f_sm, C["dim"], (x1, tp.y + 22))
+        self._txt(f"{tel.pitch:+.0f}\u00b0", self.f_lg, col, (x1, tp.y + 48))
+
+        # Pil
+        y = tp.y + 120
+        self._txt("PIL", self.f_sm, C["dim"], (x0, y))
+        w = tp.right - 24 - x0
+        if live and tel.batt_sense:
+            lvl = tel.batt_level()
+            bcol = {"ok": C["green"], "warn": C["amber"], "low": C["red"]}[lvl]
+            cell = tel.batt_v / BATT_CELLS
+            self._txt(f"{tel.batt_v:.1f} V   ({cell:.2f} V/hucre)", self.f_md, bcol,
+                      (tp.right - 24, y - 4), "topright")
+            self._meter(x0, y + 34, w, (cell - 3.3) / (4.2 - 3.3), bcol)
+            if lvl == "low" and int(now * 2) % 2 == 0:
+                self._txt("PIL DUSUK - IN!", self.f_md, C["red"], (x0, y + 54))
+        else:
+            self._txt("olcum yok" if live else "-", self.f_md, C["dim"],
+                      (tp.right - 24, y - 4), "topright")
+            self._meter(x0, y + 34, w, 0, C["dim"])
+
+        # Baglanti
+        y = tp.y + 210
+        self._txt("BAGLANTI", self.f_sm, C["dim"], (x0, y))
+        txok = tel.tx_ok(now)
+        q = tel.link if txok else 0
+        qcol = C["green"] if q >= 80 else C["amber"] if q >= 50 else C["red"]
+        info = f"%{q}   {tel.rx_rate} paket/sn" if live else f"%{q}"
+        self._txt(info, self.f_md, qcol if txok else C["dim"],
+                  (tp.right - 24, y - 4), "topright")
+        self._meter(x0, y + 34, w, q / 100.0, qcol)
+
+        # Ucak tarafi durum
+        y = tp.y + 272
+        if not txok:
+            s, c = "verici cevap vermiyor", C["dim"]
+        elif not live:
+            s, c = "UCAKTAN CEVAP YOK", C["red"]
+        else:
+            gaz = "GAZ ACIK" if tel.flags & TF_THR_ARMED else "GAZ KILITLI"
+            stab = "STAB" if tel.flags & TF_STAB else "MANUEL"
+            s, c = f"ucak: {gaz} - {stab} - ESC {tel.throttle}", C["dim"]
+        self._txt(s, self.f_sm, c, (x0, y))
 
     # -- cizim --
-    def draw(self, logic, st, link, pad_name, ch):
+    def draw(self, logic, st, link, pad_name, ch, tel):
         pg = self.pg
         cv = self.canvas
         cv.fill(C["bg"])
@@ -554,9 +798,12 @@ class Dashboard:
                   (gp.centerx, bar.bottom + 14), "midtop")
         self._txt(f"{thr} us", self.f_sm, C["dim"], (gp.centerx, bar.bottom + 58), "midtop")
 
-        # Stick'ler
-        self._stick(470, 440, st.lx, st.ly, "SOL STICK", "RUDDER", "GAZ")
-        self._stick(810, 440, st.rx, st.ry, "SAG STICK", "AILERON", "ELEV")
+        # Ucak telemetrisi + yapay ufuk
+        self._telemetry_panel(pg.Rect(274, 196, 716, 318), tel, time.monotonic())
+
+        # Stick'ler (kucuk)
+        self._stick(470, 600, st.lx, st.ly, "SOL STICK", "rud / gaz")
+        self._stick(860, 600, st.rx, st.ry, "SAG STICK", "ail / elev")
 
         # Kanal paneli
         kp = pg.Rect(1010, 196, 246, 480)
@@ -617,13 +864,19 @@ class Dashboard:
         self.pg.quit()
 
 
-def tty_status(logic, link, ch):
+def tty_status(logic, link, ch, tel):
     thr, ail, ele, rud, aux = ch
+    now = time.monotonic()
+    if tel.ok(now):
+        batt = f" PIL:{tel.batt_v:.1f}V" if tel.batt_sense else ""
+        tinfo = f"ROLL:{tel.roll:+.0f} PITCH:{tel.pitch:+.0f} LINK:%{tel.link}{batt} "
+    else:
+        tinfo = 'TELEMETRI YOK '
     s = (f"\r\033[2K{'ARMED ' if logic.armed else 'KILITLI'} "
          f"GAZ %{int(logic.throttle_pct * 100):3d} A:{ail} E:{ele} R:{rud} "
          f"STAB:{'A' if logic.stab else 'P'} RATE:{logic.rate_name} "
          f"TRIM:{logic.trims['ail']:+d}/{logic.trims['ele']:+d} "
-         f"SERI:{'OK' if link.connected else 'YOK'} {logic.message}")
+         f"SERI:{'OK' if link.connected else 'YOK'} {tinfo}{logic.message}")
     sys.stdout.write(s)
     sys.stdout.flush()
 
@@ -641,6 +894,8 @@ def main():
 
     logic = FlightLogic(load_trims())
     link = SerialLink(args.port)
+    parser = TelemetryParser()
+    tel = Telemetry()
 
     pad = None
     pad_name = ""
@@ -694,6 +949,9 @@ def main():
             ch = logic.channels() if pad is not None else logic.safe_channels()
 
             link.tick(now)
+            data = link.read()
+            if data:
+                tel.apply(parser.feed(data), now)
             if now - last_send >= SEND_PERIOD:
                 link.send(build_frame(*ch), now)
                 last_send = now
@@ -701,9 +959,9 @@ def main():
             if ui is not None:
                 if ui.events():
                     break
-                ui.draw(logic, st, link, pad_name, ch)
+                ui.draw(logic, st, link, pad_name, ch, tel)
             elif now - last_tty > 0.15:
-                tty_status(logic, link, ch)
+                tty_status(logic, link, ch, tel)
                 last_tty = now
 
             spent = time.monotonic() - now

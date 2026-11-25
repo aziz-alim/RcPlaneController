@@ -131,6 +131,38 @@ Stabilizasyon açıkken stick "hedef açı" anlamına gelir ve trim uygulanmaz.
 13 bayt: `0xAA 0x55` + 5 × uint16 LE (throttle, aileron, elevator, rudder, aux) + XOR checksum.
 Checksum'ı tutmayan ya da 1000–2000 dışındaki çerçeve atılır.
 
+## Telemetri (uçak → Deck)
+
+Alıcı her kontrol paketine NRF24 **ACK payload** ile cevap verir; cevabın içinde uçağın durumu vardır.
+Verici bunu USB üzerinden Deck'e iletir, `control.py` ortadaki panelde gösterir:
+
+- **Yapay ufuk**: yatış (roll, + = sağa yatık) ve burun açısı (pitch, + = burun yukarı), MPU6050'den.
+- **Pil**: A0'daki gerilim bölücüden (aşağıya bak), hücre başı 3.7 V altı sarı, 3.5 V altı kırmızı.
+- **Bağlantı**: vericinin ACK aldığı gönderim oranı (%) ve alıcının saniyede aldığı paket sayısı.
+- 1 sn yeni veri gelmezse ufuk grileşir, "TELEMETRİ YOK" yazar.
+
+**Verici ve alıcı aynı sürümle yüklenmeli** (ikisi de autoAck + dinamik payload kullanıyor; eski alıcı ile yeni verici konuşmaz).
+Yönü tezgâhta doğrula: uçağı elle sağa yatır → ekranda ufkun sağ ucu kalkmalı; burnu kaldır → ufuk aşağı inmeli.
+
+Verici → PC çerçevesi, 16 bayt: `0xBB 0x66` + `linkPct u8, fresh u8, seq u8, roll10 i16, pitch10 i16, battMv u16, flags u8, rxRate u8, throttle u16` + XOR checksum.
+
+### Pil ölçümü (isteğe bağlı)
+
+```
+pil + (ana kablo ya da denge soketinin en dış ucu) ──[10k]──┬──[1k]──[1k]── GND
+                                                            └── A0
+```
+
+10k = kahve-siyah-turuncu, 1k = kahve-siyah-kırmızı (iki tane seri = 2k). 12.6 V'ta A0 ≈ 2.1 V olur;
+çözünürlük ~30 mV, sürekli çekiş ~1 mA. Dirençleri multimetreyle ölçüp `BATT_R_TOP/BOT`'a gerçek değerleri yazarsan ölçüm daha doğru olur. Bağladıktan sonra `receiver.ino`'da `BATT_SENSE = true` yap,
+Nano'nun 5V pinini multimetreyle ölçüp `BATT_VREF_MV`'ye yaz. Bölücü bağlı değilken `true` yapma.
+
+### Buzzer (isteğe bağlı, D8)
+
+`D8 ──[100Ω]── buzzer +`, `buzzer − ── GND`. `BUZZER_MODE`: `BUZZER_ACTIVE` (sabit tonlu) veya `BUZZER_PASSIVE` (`tone()`).
+Açılışta kısa bip; sinyal 5 sn'den uzun yoksa 2 sn'de bir bulucu bip (kayıp uçak); pil düşükse 4 sn'de bir kısa bip.
+Varsayılan `BUZZER_NONE`.
+
 ## Güvenlik
 
 - **Gaz kilidi (alıcı):** Bağlantı kurulunca veya koptuktan sonra gaz, önce ≤1050 görülmeden açılmaz.
