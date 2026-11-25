@@ -30,8 +30,8 @@
  *   D3  -> ESC (Gaz/Throttle)
  *   D5  -> Sag Kanat Aileron  (aileron ile dogru orantili)
  *   D4  -> Sol Kanat Aileron  (aileron ters, otomatik mix)
- *   D6  -> Elevator (Kuyruk Yatay)
- *   D7  -> Rudder   (Kuyruk Dikey)
+ *   D6  -> Rudder   (Kuyruk Dikey)
+ *   D7  -> Elevator (Kuyruk Yatay)
  *
  * ESC -> Motor -> Pil baglantisi:
  *   ESC 3x mavi kablo  -> Brushless motor 3 kablosu
@@ -99,19 +99,19 @@ Servo servoRudder;
 const int PIN_ESC            = 3;
 const int PIN_RIGHT_AILERON  = 5;
 const int PIN_LEFT_AILERON   = 4;
-const int PIN_ELEVATOR       = 6;
-const int PIN_RUDDER         = 7;
+const int PIN_ELEVATOR       = 7;
+const int PIN_RUDDER         = 6;
 const int PIN_LED            = LED_BUILTIN;
 const int PIN_BUZZER         = 8;
 const int PIN_BATT           = A0;
 
 // ── Pil olcumu ──
 // Bolucu baglamadan true YAPMA (bos A0 rastgele deger okur).
-const bool  BATT_SENSE   = false;
+const bool  BATT_SENSE   = true;
 // Multimetreyle olculen gercek degerleri yazarsan olcum daha dogru olur.
 const float BATT_R_TOP   = 9.85;    // kOhm, pil+ tarafi (10k, olculen 2026-11-25)
 const float BATT_R_BOT   = 1.921;   // kOhm, GND tarafi (2 x 1k seri: 0.965 + 0.956 olculen)
-const float BATT_VREF_MV = 5000.0;  // Nano 5V pinini multimetreyle olc, buraya yaz
+const float BATT_VREF_MV = 5000.0;  // Nano 5V 5.11 V olculdu ama 5000 ile okuma multimetreyle birebir (11.7 V), dokunma
 const uint8_t  BATT_CELLS       = 3;
 const uint16_t BATT_LOW_MV_CELL = 3500;
 uint16_t battMv = 0;
@@ -343,7 +343,7 @@ void setup() {
   armed = true;
   beep(150);
   Serial.println(F("=== RC Alici Hazir ==="));
-  Serial.println(F("D3=ESC D5=SagAil D4=SolAil D6=Elev D7=Rudd"));
+  Serial.println(F("D3=ESC D5=SagAil D4=SolAil D6=Rudd D7=Elev"));
   Serial.println(F("AUX>1500 = Stabilizasyon AKTIF"));
   Serial.println();
 }

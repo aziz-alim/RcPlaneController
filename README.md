@@ -25,8 +25,8 @@ Kumanda ve alıcı aynı kuralı kullanır; servo yönleri yalnız alıcıda aya
 |---|---|---|---|
 | Throttle | D3 (ESC) | daha fazla gaz | Sol stick Y (artımlı) |
 | Aileron | D5 sağ, D4 sol | sağa yatış | Sağ stick X |
-| Elevator | D6 | burun yukarı | Sağ stick Y (geri çek = burun yukarı) |
-| Rudder | D7 | burun sağa | Sol stick X |
+| Elevator | D7 | burun yukarı | Sağ stick Y (geri çek = burun yukarı) |
+| Rudder | D6 | burun sağa | Sol stick X |
 | AUX | — | 2000 = stabilizasyon açık | A |
 
 Bir yüzey ters gidiyorsa `receiver.ino` içinde ilgili sabiti değiştir:

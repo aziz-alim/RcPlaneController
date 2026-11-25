@@ -314,6 +314,40 @@ class EvdevGamepad:
             pass
 
 
+class KeyboardPad:
+    """Mac/masaustu tezgah testi: klavye ile yuzey kontrolu.
+
+    Oklar = sag stick (sol/sag kanatcik, yukari = burun asagi, asagi = burun
+    yukari), A/D = dumen, Bosluk = STAB, R = RATE. L1/R1/gaz eslenmez:
+    bu modda ARM imkansizdir, gaz her zaman 0 kalir.
+    """
+
+    name = "KLAVYE (test, ARM kapali)"
+
+    def __init__(self, pg):
+        self.pg = pg
+        self.state = GamepadState()
+
+    def poll(self):
+        k = self.pg.key.get_pressed()
+        st = self.state
+        st.rx = float(k[self.pg.K_RIGHT]) - float(k[self.pg.K_LEFT])
+        st.ry = float(k[self.pg.K_DOWN]) - float(k[self.pg.K_UP])
+        st.lx = float(k[self.pg.K_d]) - float(k[self.pg.K_a])
+        st.ly = 0.0
+        st.l2 = st.r2 = 0.0
+        st.hat_x = st.hat_y = 0
+        st.buttons = set()
+        if k[self.pg.K_SPACE]:
+            st.buttons.add("A")
+        if k[self.pg.K_r]:
+            st.buttons.add("X")
+        return st
+
+    def close(self):
+        pass
+
+
 # ═══════════════════════════════════════════════════════════════
 # Kontrol mantigi (donanimdan bagimsiz, test edilebilir)
 # ═══════════════════════════════════════════════════════════════
@@ -890,6 +924,8 @@ def main():
     ap.add_argument("--tty", action="store_true", help="arayuzsuz terminal modu")
     ap.add_argument("--windowed", action="store_true", help="tam ekran yerine pencere")
     ap.add_argument("--port", help="seri port (varsayilan: otomatik)")
+    ap.add_argument("--klavye", action="store_true",
+                    help="tezgah testi: yuzeyleri klavyeyle oynat (ARM kapali)")
     args = ap.parse_args()
 
     logic = FlightLogic(load_trims())
@@ -907,6 +943,15 @@ def main():
             ui = Dashboard(windowed=args.windowed)
         except Exception as e:
             print(f"[UI] arayuz acilamadi ({e}), terminal moduna geciliyor")
+
+    keyboard = False
+    if args.klavye:
+        if ui is None:
+            print("[KLAVYE] arayuz olmadan klavye modu calismaz")
+        else:
+            pad = KeyboardPad(ui.pg)
+            pad_name = pad.name
+            keyboard = True
 
     empty = GamepadState()
     last = time.monotonic()
@@ -941,6 +986,9 @@ def main():
                     logic._say("KUMANDA KOPTU", now)
 
             logic.update(st, dt, now)
+            if keyboard:
+                logic.armed = False          # klavye modunda gaz asla acilmaz
+                logic.throttle_pct = 0.0
             if logic.trims_dirty:
                 save_trims(logic.trims)
                 logic.trims_dirty = False
